@@ -47,6 +47,8 @@ type goWorkerWithFunc struct {
 func (w *goWorkerWithFunc) run() {
 	w.pool.addRunning(1)
 	go func() {
+		unregister := w.pool.registerWorker()
+		defer unregister()
 		defer func() {
 			if w.pool.addRunning(-1) == 0 && w.pool.IsClosed() {
 				w.pool.once.Do(func() {

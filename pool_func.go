@@ -32,10 +32,13 @@ type PoolWithFunc struct {
 
 // Invoke passes arguments to the pool.
 //
-// Note that you are allowed to call Pool.Invoke() from the current Pool.Invoke(),
-// but what calls for special attention is that you will get blocked with the last
-// Pool.Invoke() call once the current Pool runs out of its capacity, and to avoid this,
-// you should instantiate a PoolWithFunc with ants.WithNonblocking(true).
+// It is allowed to call PoolWithFunc.Invoke() from inside a task running on
+// the same pool (a nested invocation): when the pool has run out of capacity,
+// such a nested invocation is served by a transient overflow worker instead of
+// blocking, so the pool won't deadlock. The overflow worker retires itself
+// once the task is done and the pool converges back to its capacity.
+// Note that a pool instantiated with ants.WithNonblocking(true) keeps its
+// fail-fast contract and returns ErrPoolOverload even for nested invocations.
 func (p *PoolWithFunc) Invoke(arg any) error {
 	if p.IsClosed() {
 		return ErrPoolClosed

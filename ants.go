@@ -191,6 +191,12 @@ type poolCommon struct {
 	// waiting is the number of goroutines already been blocked on pool.Submit(), protected by pool.lock
 	waiting int32
 
+	// workerGoIDs holds the goroutine IDs of all live workers owned by this pool.
+	// It is consulted on the saturated submit path to tell a nested submission
+	// (a worker submitting to its own pool) apart from an external one, so the
+	// former can be kept from blocking and deadlocking the pool.
+	workerGoIDs sync.Map // int64 -> struct{}
+
 	purgeDone int32
 	purgeCtx  context.Context
 	stopPurge context.CancelFunc
@@ -508,6 +514,25 @@ func (p *poolCommon) addWaiting(delta int) {
 	atomic.AddInt32(&p.waiting, int32(delta))
 }
 
+// registerWorker marks the calling goroutine as a worker of this pool.
+// It must be called from the worker's own goroutine, and the returned
+// function must be called when that goroutine exits.
+func (p *poolCommon) registerWorker() (unregister func()) {
+	id := curGoID()
+	p.workerGoIDs.Store(id, struct{}{})
+	return func() {
+		p.workerGoIDs.Delete(id)
+	}
+}
+
+// isPoolWorker reports whether the calling goroutine is a worker of this pool,
+// i.e. whether an in-flight submission originates from inside a task running
+// on this very pool (a nested submission).
+func (p *poolCommon) isPoolWorker() bool {
+	_, ok := p.workerGoIDs.Load(curGoID())
+	return ok
+}
+
 // retrieveWorker returns an available worker to run the tasks.
 func (p *poolCommon) retrieveWorker() (w worker, err error) {
 	p.lock.Lock()
@@ -528,8 +553,27 @@ retry:
 		return
 	}
 
-	// Bail out early if it's in nonblocking mode or the number of pending callers reaches the maximum limit value.
-	if p.options.Nonblocking || (p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks) {
+	// Bail out early if it's in nonblocking mode.
+	if p.options.Nonblocking {
+		p.lock.Unlock()
+		return nil, ErrPoolOverload
+	}
+
+	// A nested submission - the caller is a worker of this very pool, currently
+	// executing a task. Blocking it here would deadlock the pool once all
+	// workers end up waiting on workers that can never be handed back, so
+	// spawn a transient overflow worker instead. The extra worker retires
+	// itself right after the task via the over-capacity check in revertWorker,
+	// thus the pool converges back to its configured capacity.
+	if p.isPoolWorker() {
+		w = p.workerCache.Get().(worker)
+		w.run()
+		p.lock.Unlock()
+		return
+	}
+
+	// Bail out early if the number of pending callers reaches the maximum limit value.
+	if p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks {
 		p.lock.Unlock()
 		return nil, ErrPoolOverload
 	}
